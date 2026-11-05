@@ -67,11 +67,19 @@ RETRY_WAIT_SECONDS = 30
 REVIEWS_LIMIT_PER_BRANCH = 200
 
 # Which branches to run: keys in config.list_of_links starting with this prefix.
-# Defaults to ENBD branches; set BRANCH_PREFIX env var to override.
+# Defaults to EI branches; set BRANCH_PREFIX env var to override.
 BRANCH_PREFIX = os.getenv("BRANCH_PREFIX", "ENBD")
 
-# How many days back to report on (1 = yesterday, UAE time)
-DAYS_BACK = 1
+# Report window: only reviews posted in the last LOOKBACK_HOURS (rolling, from the moment
+# each branch is scraped). Reviews Google labels "a day ago" or older are always excluded.
+LOOKBACK_HOURS = 24
+
+# Matches Google's relative dates that are 1 day or older, e.g. "a day ago", "2 days ago", "a week ago"
+OLDER_THAN_A_DAY = re.compile(
+    r"\b(a|an|\d+)\s+(day|days|week|weeks|month|months|year|years)\s+ago\b"
+    r"|يوم|أيام|يومين|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات",
+    re.IGNORECASE,
+)
 
 # ----------------------------------
 # HELPER FUNCTIONS
@@ -559,14 +567,14 @@ def send_simple_email(subject, body):
 # MAIN RUN CODE
 # ----------------------------------
 
-# Step 1 : Google Reviews from yesterday (UAE time)  [APIFY]
+# Step 1 : Google Reviews from the last 24 hours (UAE time)  [APIFY]
 
 apify_client = ApifyClient(APIFY_TOKEN)
 
-yesterday = (datetime.now(TZ) - timedelta(days=DAYS_BACK)).date()
-window_start = datetime.combine(yesterday, dtime.min, tzinfo=TZ)
-window_end   = datetime.combine(yesterday, dtime(23, 59, 59), tzinfo=TZ)
-print(f"Target day (UAE): {yesterday}")
+run_started = datetime.now(TZ)
+yesterday = (run_started - timedelta(days=1)).date()   # only used to tell Apify how far back to fetch
+print(f"Reporting reviews from the last {LOOKBACK_HOURS} hours "
+      f"(run started {run_started:%Y-%m-%d %H:%M} UAE)")
 
 
 def resolve_short_url(url):
@@ -639,12 +647,28 @@ def fetch_branch_reviews(branch_key, url):
     raise RuntimeError(f"Apify run failed after {MAX_ATTEMPTS} attempts ({last_error})")
 
 
+def _relative_date_text(r):
+    """Return any 'x ago'-style text the scraper included in the item (field names vary)."""
+    for k, v in r.items():
+        kl = k.lower()
+        if isinstance(v, str) and ("ago" in v.lower() or "قبل" in v) and \
+                any(w in kl for w in ("date", "time", "ago", "relative", "published")):
+            return v
+    return None
+
+
 def apify_items_to_cards(items):
     """
     Convert Apify items into the card format:
     review_id, name, rating (text like '2 stars'), comment, date, response.
-    Keeps only reviews posted on the target day (UAE time).
+    Keeps only reviews posted in the last LOOKBACK_HOURS.
     """
+    # Window is measured from NOW (after this branch's Apify run has finished).
+    # If the scraper turned Google's "a day ago" into "scrape time - 24h", that
+    # date is older than this cutoff and is dropped -- so it can't repeat in the next day's run.
+    window_end = datetime.now(TZ)
+    window_start = window_end - timedelta(hours=LOOKBACK_HOURS)
+
     cards = []
     seen_ids = set()
 
@@ -653,13 +677,21 @@ def apify_items_to_cards(items):
         if review_id in seen_ids:
             continue
 
-        # Date (UTC -> UAE, filter to target day)
-        d = pd.to_datetime(r.get("reviewed_at_date"), utc=True, errors="coerce")
+        # Google's own label: skip anything shown as "a day ago" or older
+        rel = _relative_date_text(r)
+        if rel and OLDER_THAN_A_DAY.search(rel):
+            continue
+
+        # Date (UTC -> UAE, keep only the last LOOKBACK_HOURS)
+        raw_date = r.get("reviewed_at_date")
+        d = pd.to_datetime(raw_date, utc=True, errors="coerce")
         if pd.isna(d):
             continue
-        if not (window_start <= d <= window_end):
+        if not (window_start < d <= window_end):
             continue
         date_obj = d.tz_convert("Asia/Dubai").tz_localize(None)
+        print(f"    kept review {review_id}: reviewed_at_date={raw_date}"
+              + (f", label='{rel}'" if rel else ""))
 
         # Rating -> '1 star' / '2 stars' ...
         rating_val = r.get("rating")
@@ -850,7 +882,7 @@ if no_negative_reviews == 0 and response_json is not None:
 
     opening_line = (
         "Hello team,<br>"
-        f"Here is a summary of the negative Google reviews received yesterday from all {BRANCH_PREFIX} branches."
+        f"Here is a summary of the negative Google reviews received in the last 24 hours from all {BRANCH_PREFIX} branches."
     )
 
     with open(f"daily_negative_google_reviews_{date_suffix}.png", "rb") as img_file:
