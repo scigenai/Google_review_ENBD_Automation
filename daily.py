@@ -67,19 +67,16 @@ RETRY_WAIT_SECONDS = 30
 REVIEWS_LIMIT_PER_BRANCH = 200
 
 # Which branches to run: keys in config.list_of_links starting with this prefix.
-# Defaults to EI branches; set BRANCH_PREFIX env var to override.
+# Defaults to ENBD branches; set BRANCH_PREFIX env var to override.
 BRANCH_PREFIX = os.getenv("BRANCH_PREFIX", "ENBD")
 
-# Report window: only reviews posted in the last LOOKBACK_HOURS (rolling, from the moment
-# each branch is scraped). Reviews Google labels "a day ago" or older are always excluded.
-LOOKBACK_HOURS = 24
-
-# Matches Google's relative dates that are 1 day or older, e.g. "a day ago", "2 days ago", "a week ago"
-OLDER_THAN_A_DAY = re.compile(
-    r"\b(a|an|\d+)\s+(day|days|week|weeks|month|months|year|years)\s+ago\b"
-    r"|يوم|أيام|يومين|أسبوع|أسابيع|شهر|أشهر|سنة|سنوات",
-    re.IGNORECASE,
-)
+# The scraper only gives each review's DATE, not its time (every review comes back as
+# "YYYY-MM-DDT00:00:00Z"), so an exact "last 24 hours" cut is impossible.
+# Instead the script looks at reviews dated today or yesterday (UTC) and skips every
+# review it already reported in an earlier run. Each review is reported exactly once.
+LOOKBACK_DAYS = 2
+REPORTED_FILE = f"reported_reviews_{BRANCH_PREFIX}.json"   # committed back to the repo by the workflow
+KEEP_REPORTED_DAYS = 30                                      # forget IDs older than this
 
 # ----------------------------------
 # HELPER FUNCTIONS
@@ -567,14 +564,47 @@ def send_simple_email(subject, body):
 # MAIN RUN CODE
 # ----------------------------------
 
-# Step 1 : Google Reviews from the last 24 hours (UAE time)  [APIFY]
+# Step 1 : New Google Reviews since the last report  [APIFY]
 
 apify_client = ApifyClient(APIFY_TOKEN)
 
 run_started = datetime.now(TZ)
-yesterday = (run_started - timedelta(days=1)).date()   # only used to tell Apify how far back to fetch
-print(f"Reporting reviews from the last {LOOKBACK_HOURS} hours "
-      f"(run started {run_started:%Y-%m-%d %H:%M} UAE)")
+today_utc = datetime.now(ZoneInfo("UTC")).date()
+first_date = today_utc - timedelta(days=LOOKBACK_DAYS - 1)
+print(f"Run started {run_started:%Y-%m-%d %H:%M} UAE. Looking at reviews dated "
+      f"{first_date} to {today_utc} that were not reported before.")
+
+
+def load_reported():
+    """Review IDs already sent in an earlier report: {review_id: 'YYYY-MM-DD'}."""
+    try:
+        with open(REPORTED_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[WARN] Could not read {REPORTED_FILE}, starting fresh: {e}")
+        return {}
+
+
+def save_reported(reported, new_ids):
+    today = run_started.date().isoformat()
+    for rid in new_ids:
+        reported.setdefault(rid, today)
+    cutoff = (run_started.date() - timedelta(days=KEEP_REPORTED_DAYS)).isoformat()
+    reported = {k: v for k, v in reported.items() if v >= cutoff}
+    with open(REPORTED_FILE, "w", encoding="utf-8") as f:
+        json.dump(reported, f, indent=0, sort_keys=True)
+    print(f"[STATE] {len(new_ids)} review(s) marked as reported; {REPORTED_FILE} now holds {len(reported)}.")
+
+
+reported = load_reported()
+today_uae = run_started.date().isoformat()
+# Only reviews reported on an EARLIER day (UAE date) are skipped.
+# Re-running on the same day reproduces that day's full report.
+reported_before_today = {rid for rid, day in reported.items() if day < today_uae}
+print(f"[STATE] {len(reported_before_today)} review(s) were reported on earlier days and will be skipped.")
+_printed_fields = False
 
 
 def resolve_short_url(url):
@@ -615,8 +645,8 @@ def fetch_branch_reviews(branch_key, url):
 
     run_input = {
         "place_urls": [full_url],
-        # ask from 1 day before target so timezone edges can't drop anything; exact filtering is done below
-        "anyDate": (yesterday - timedelta(days=1)).isoformat(),
+        # ask from 1 day earlier so nothing is cut off at the edge; exact filtering is done below
+        "anyDate": (first_date - timedelta(days=1)).isoformat(),
         "order": "newest",
         "source": "google",
         "limit": REVIEWS_LIMIT_PER_BRANCH,
@@ -647,51 +677,38 @@ def fetch_branch_reviews(branch_key, url):
     raise RuntimeError(f"Apify run failed after {MAX_ATTEMPTS} attempts ({last_error})")
 
 
-def _relative_date_text(r):
-    """Return any 'x ago'-style text the scraper included in the item (field names vary)."""
-    for k, v in r.items():
-        kl = k.lower()
-        if isinstance(v, str) and ("ago" in v.lower() or "قبل" in v) and \
-                any(w in kl for w in ("date", "time", "ago", "relative", "published")):
-            return v
-    return None
-
-
 def apify_items_to_cards(items):
     """
     Convert Apify items into the card format:
     review_id, name, rating (text like '2 stars'), comment, date, response.
-    Keeps only reviews posted in the last LOOKBACK_HOURS.
+    Keeps reviews dated first_date..today_utc that were NOT reported in an earlier run.
     """
-    # Window is measured from NOW (after this branch's Apify run has finished).
-    # If the scraper turned Google's "a day ago" into "scrape time - 24h", that
-    # date is older than this cutoff and is dropped -- so it can't repeat in the next day's run.
-    window_end = datetime.now(TZ)
-    window_start = window_end - timedelta(hours=LOOKBACK_HOURS)
+    global _printed_fields
+    if items and not _printed_fields:
+        print(f"    [DEBUG] fields in a scraped review: {sorted(items[0].keys())}")
+        _printed_fields = True
 
     cards = []
     seen_ids = set()
+    already = 0
 
     for r in items:
         review_id = r.get("review_id")
         if review_id in seen_ids:
             continue
-
-        # Google's own label: skip anything shown as "a day ago" or older
-        rel = _relative_date_text(r)
-        if rel and OLDER_THAN_A_DAY.search(rel):
+        if review_id in reported_before_today:
+            already += 1
             continue
 
-        # Date (UTC -> UAE, keep only the last LOOKBACK_HOURS)
+        # Date only (scraper gives midnight UTC) -> keep today and yesterday
         raw_date = r.get("reviewed_at_date")
         d = pd.to_datetime(raw_date, utc=True, errors="coerce")
         if pd.isna(d):
             continue
-        if not (window_start < d <= window_end):
+        if not (first_date <= d.date() <= today_utc):
             continue
-        date_obj = d.tz_convert("Asia/Dubai").tz_localize(None)
-        print(f"    kept review {review_id}: reviewed_at_date={raw_date}"
-              + (f", label='{rel}'" if rel else ""))
+        date_obj = d.tz_convert(None)
+        print(f"    new review {review_id[:20]}...: reviewed_at_date={raw_date}, rating={r.get('rating')}")
 
         # Rating -> '1 star' / '2 stars' ...
         rating_val = r.get("rating")
@@ -719,6 +736,8 @@ def apify_items_to_cards(items):
         })
         seen_ids.add(review_id)
 
+    if already:
+        print(f"    skipped {already} review(s) already reported on an earlier day")
     return cards
 
 
@@ -753,6 +772,7 @@ selected_branches = {k: v for k, v in list_of_links.items() if k.startswith(BRAN
 print(f"Branches to process ({BRANCH_PREFIX}): {len(selected_branches)}")
 
 all_reviews_rows  = []
+new_review_ids    = set()
 failed_branches   = []
 no_negative_reviews = 0
 
@@ -763,9 +783,10 @@ for key, value in selected_branches.items():
     try:
         items = fetch_branch_reviews(key, value)
         raw_reviews = apify_items_to_cards(items)
+        new_review_ids.update(c['review_id'] for c in raw_reviews)
 
         if not raw_reviews:
-            print(f"  [INFO] No reviews on target day for: {key}")
+            print(f"  [INFO] No new reviews for: {key}")
             continue
 
         reviews_df = pd.DataFrame(raw_reviews)
@@ -802,7 +823,7 @@ else:
 
     if final_df_reviews.empty:
         no_negative_reviews = 1
-        message = "No negative reviews found in last 24 hours."
+        message = f"No new negative Google reviews for {BRANCH_PREFIX} branches since the last report."
         print(f"\n{message}")
         send_simple_email(
             subject=f"Google Reviews Automation Update - {date_suffix}",
@@ -882,7 +903,7 @@ if no_negative_reviews == 0 and response_json is not None:
 
     opening_line = (
         "Hello team,<br>"
-        f"Here is a summary of the negative Google reviews received in the last 24 hours from all {BRANCH_PREFIX} branches."
+        f"Here is a summary of the new negative Google reviews (posted since the last report) from all {BRANCH_PREFIX} branches."
     )
 
     with open(f"daily_negative_google_reviews_{date_suffix}.png", "rb") as img_file:
@@ -914,5 +935,13 @@ if no_negative_reviews == 0 and response_json is not None:
         smtp.sendmail(sender_email, receiver_email, msg.as_string())
 
     print("Email sent successfully with embedded image!")
+
+# Step 5 : Remember what was reported (with today's date), so the next DAY's run doesn't repeat it.
+# Skipped if negatives were found but the report email could not be produced,
+# so those reviews are picked up again next run.
+if no_negative_reviews == 1 or response_json is not None:
+    save_reported(reported, new_review_ids)
+else:
+    print("[STATE] Report not sent; reviews NOT marked as reported (they will be retried next run).")
 
 ################################ End of Code #################################
